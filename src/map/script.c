@@ -569,6 +569,7 @@ int add_str(const char* p)
 	safestrncpy(script->str_buf+script->str_pos, p, len+1);
 	script->str_data[script->str_num].type = C_NOP;
 	script->str_data[script->str_num].str = script->str_pos;
+	script->str_data[script->str_num].val = 0;
 	script->str_data[script->str_num].next = 0;
 	script->str_data[script->str_num].func = NULL;
 	script->str_data[script->str_num].backpatch = -1;
@@ -1964,10 +1965,15 @@ void script_set_constant(const char* name, int value, bool isparameter) {
 		ShowError("script_set_constant: Invalid name for %s '%s' (already defined as %s).\n", isparameter ? "parameter" : "constant", name, script_op2name(script->str_data[n].type));
 	}
 }
-/* will override if necessary */
+/* adds data to a existent constant in the database, inserted normally via parse */
 void script_set_constant2(const char *name, int value, bool isparameter) {
 	int n = add_str(name);
-	
+
+	if( ( script->str_data[n].type == C_NAME || script->str_data[n].type == C_PARAM ) && ( script->str_data[n].val != 0 || script->str_data[n].backpatch != -1 ) ) { // existing parameter or constant
+		ShowNotice("Conflicting item/script var '%s', prioritising the script var\n",name);
+		return;
+	}
+
 	if( script->str_data[n].type != C_NOP ) {
 		script->str_data[n].func = NULL;
 		script->str_data[n].backpatch = -1;
@@ -1976,6 +1982,22 @@ void script_set_constant2(const char *name, int value, bool isparameter) {
 
 	script->str_data[n].type = isparameter ? C_PARAM : C_INT;
 	script->str_data[n].val  = value;
+
+}
+/* same as constant2 except it will override if necessary, used to clear conflicts during reload  */
+void script_set_constant_force(const char *name, int value, bool isparameter) {
+	int n = add_str(name);
+	
+	if( script->str_data[n].type == C_PARAM )
+		return;/* the one type we don't mess with, reload doesn't affect it. */
+		
+	if( script->str_data[n].type != C_NOP ) {
+		script->str_data[n].type = C_NOP;
+		script->str_data[n].val = 0;
+		script->str_data[n].func = NULL;
+		script->str_data[n].backpatch = -1;
+		script->str_data[n].label = -1;
+	}
 }
 /*==========================================
  * Reading constant databases
@@ -3869,6 +3891,9 @@ int script_reload() {
 	db_clear(script->st_db);
 	
 	mapreg_reload();
+	
+	itemdb->force_name_constants();
+	
 	return 0;
 }
 
@@ -12594,20 +12619,15 @@ BUILDIN(npctalk)
 }
 
 // change npc walkspeed [Valaris]
-BUILDIN(npcspeed)
-{
+BUILDIN(npcspeed) {
 	struct npc_data* nd;
 	int speed;
 	
 	speed = script_getnum(st,2);
-	nd =(struct npc_data *)iMap->id2bl(st->oid);
+	nd = (struct npc_data *)iMap->id2bl(st->oid);
 	
 	if( nd ) {
-		if( nd->ud == &npc_base_ud ) {
-			nd->ud = NULL;
-			CREATE(nd->ud, struct unit_data, 1);
-			unit_dataset(&nd->bl);
-		}
+		unit_bl2ud2(&nd->bl); // ensure nd->ud is safe to edit
 		nd->speed = speed;
 		nd->ud->state.speed_changed = 1;
 	}
@@ -12622,13 +12642,8 @@ BUILDIN(npcwalkto) {
 	x=script_getnum(st,2);
 	y=script_getnum(st,3);
 	
-	if(nd) {
-		if( nd->ud == &npc_base_ud ) {
-			nd->ud = NULL;
-			CREATE(nd->ud, struct unit_data, 1);
-			unit_dataset(&nd->bl);
-		}
-		
+	if( nd ) {
+		unit_bl2ud2(&nd->bl); // ensure nd->ud is safe to edit
 		if (!nd->status.hp) {
 			status_calc_npc(nd, true);
 		} else {
@@ -12640,11 +12655,11 @@ BUILDIN(npcwalkto) {
 	return true;
 }
 // stop an npc's movement [Valaris]
-BUILDIN(npcstop)
-{
-	struct npc_data *nd=(struct npc_data *)iMap->id2bl(st->oid);
+BUILDIN(npcstop) {
+	struct npc_data *nd = (struct npc_data *)iMap->id2bl(st->oid);
 	
-	if(nd) {
+	if( nd ) {
+		unit_bl2ud2(&nd->bl); // ensure nd->ud is safe to edit
 		unit_stop_walking(&nd->bl,1|4);
 	}
 	
@@ -14885,23 +14900,23 @@ BUILDIN(pcstopfollow)
 ///
 /// unitwalk(<unit_id>,<x>,<y>) -> <bool>
 /// unitwalk(<unit_id>,<map_id>) -> <bool>
-BUILDIN(unitwalk)
-{
+BUILDIN(unitwalk) {
 	struct block_list* bl;
 	
 	bl = iMap->id2bl(script_getnum(st,2));
-	if( bl == NULL )
-	{
+	if( bl == NULL ) {
 		script_pushint(st, 0);
+		return true;
 	}
-	else if( script_hasdata(st,4) )
-	{
+
+	if( bl->type == BL_NPC ) {
+		unit_bl2ud2(bl); // ensure the ((TBL_NPC*)bl)->ud is safe to edit
+	}
+	if( script_hasdata(st,4) ) {
 		int x = script_getnum(st,3);
 		int y = script_getnum(st,4);
 		script_pushint(st, unit_walktoxy(bl,x,y,0));// We'll use harder calculations.
-	}
-	else
-	{
+	} else {
 		int map_id = script_getnum(st,3);
 		script_pushint(st, unit_walktobl(bl,iMap->id2bl(map_id),65025,1));
 	}
@@ -14925,8 +14940,7 @@ BUILDIN(unitkill)
 /// Returns if it was successfull
 ///
 /// unitwarp(<unit_id>,"<map name>",<x>,<y>) -> <bool>
-BUILDIN(unitwarp)
-{
+BUILDIN(unitwarp) {
 	int unit_id;
 	int map;
 	short x;
@@ -14949,10 +14963,12 @@ BUILDIN(unitwarp)
 	else
 		map = iMap->mapname2mapid(mapname);
 	
-	if( map >= 0 && bl != NULL )
+	if( map >= 0 && bl != NULL ) {
+		unit_bl2ud2(bl); // ensure ((TBL_NPC*)bl)->ud is safe to edit
 		script_pushint(st, unit_warp(bl,map,x,y,CLR_OUTSIGHT));
-	else
+	} else {
 		script_pushint(st, 0);
+	}
 	
 	return true;
 }
@@ -15022,8 +15038,7 @@ BUILDIN(unitattack)
 /// Makes the unit stop attacking and moving
 ///
 /// unitstop <unit_id>;
-BUILDIN(unitstop)
-{
+BUILDIN(unitstop) {
 	int unit_id;
 	struct block_list* bl;
 	
@@ -15032,6 +15047,7 @@ BUILDIN(unitstop)
 	bl = iMap->id2bl(unit_id);
 	if( bl != NULL )
 	{
+		unit_bl2ud2(bl); // ensure ((TBL_NPC*)bl)->ud is safe to edit
 		unit_stop_attack(bl);
 		unit_stop_walking(bl,4);
 		if( bl->type == BL_MOB )
@@ -18139,8 +18155,8 @@ void script_defaults(void) {
 	script->hqs = script->hqis = 0;
 	memset(&script->hqe, 0, sizeof(script->hqe));
 	
-	script->buildin_count = 0;
 	script->buildin = NULL;
+	script->buildin_count = 0;
 	
 	script->str_data = NULL;
 	script->str_data_size = 0;
@@ -18175,7 +18191,9 @@ void script_defaults(void) {
 	script->pop_stack = pop_stack;
 	script->set_constant = script_set_constant;
 	script->set_constant2 = script_set_constant2;
+	script->set_constant_force = script_set_constant_force;
 	script->get_constant = 	script_get_constant;
+	script->label_add = script_label_add;
 	
 	script->queue = script_hqueue_get;
 	script->queue_add = script_hqueue_add;
@@ -18183,6 +18201,4 @@ void script_defaults(void) {
 	script->queue_remove = script_hqueue_remove;
 	script->queue_create = script_hqueue_create;
 	script->queue_clear = script_hqueue_clear;
-	
-	script->label_add = script_label_add;
 }
